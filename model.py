@@ -14,10 +14,45 @@ AUTOGRADER CONTRACT (DO NOT MODIFY SIGNATURES):
 
 import copy
 import math
+import re
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+
+
+class _InferenceVocab:
+    def __init__(self, itos: list[str], stoi: dict[str, int]) -> None:
+        self.itos = itos
+        self.stoi = stoi
+        self.idx_to_token = itos
+        self.token_to_idx = stoi
+        self.unk_idx = stoi["<unk>"]
+        self.pad_idx = stoi["<pad>"]
+        self.sos_idx = stoi["<sos>"]
+        self.eos_idx = stoi["<eos>"]
+
+    def lookup_token(self, idx: int) -> str:
+        if 0 <= idx < len(self.itos):
+            return self.itos[idx]
+        return "<unk>"
+
+    def lookup_indices(self, tokens: list[str]) -> list[int]:
+        return [self.stoi.get(token, self.unk_idx) for token in tokens]
+
+
+def _fallback_tokenize(text: str) -> list[str]:
+    return re.findall(r"\w+|[^\w\s]", text.lower(), flags=re.UNICODE)
+
+
+def _build_inference_assets():
+    from fast_vocab import SRC_ITOS, SRC_STOI, TGT_ITOS, TGT_STOI
+
+    return {
+        "src_vocab": _InferenceVocab(SRC_ITOS, SRC_STOI),
+        "tgt_vocab": _InferenceVocab(TGT_ITOS, TGT_STOI),
+        "src_tokenizer": _fallback_tokenize,
+    }
 
 
 def scaled_dot_product_attention(
@@ -338,7 +373,7 @@ class Transformer(nn.Module):
     Full Encoder-Decoder Transformer for sequence-to-sequence tasks.
     """
 
-    _cached_dataset = None
+    _cached_inference_assets = None
 
     def __init__(
         self,
@@ -456,35 +491,29 @@ class Transformer(nn.Module):
         Greedy decoding inference for the autograder.
         """
         device = next(self.parameters()).device
-        
-        # Load vocabularies lazily to save time during multiple inferences
-        if Transformer._cached_dataset is None:
-            import sys
-            import os
-            # Ensure we can import from the current directory
-            sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-            from dataset import Multi30kDataset
-            Transformer._cached_dataset = Multi30kDataset(split="test", min_freq=2, max_length=100)
-            
-        dataset = Transformer._cached_dataset
-        src_vocab = dataset.src_vocab
-        tgt_vocab = dataset.tgt_vocab
-        src_tokenizer = dataset.src_tokenizer
-        
+
+        if Transformer._cached_inference_assets is None:
+            Transformer._cached_inference_assets = _build_inference_assets()
+
+        assets = Transformer._cached_inference_assets
+        src_vocab = assets["src_vocab"]
+        tgt_vocab = assets["tgt_vocab"]
+        src_tokenizer = assets["src_tokenizer"]
+
         # Tokenize source text
         tokens = src_tokenizer(src_text)
         src_ids = [src_vocab.sos_idx] + src_vocab.lookup_indices(tokens) + [src_vocab.eos_idx]
         src_tensor = torch.tensor(src_ids, dtype=torch.long).unsqueeze(0).to(device)
-        
+
         # Create masks
         src_mask = make_src_mask(src_tensor, pad_idx=src_vocab.pad_idx)
-        
+
         # Generate target tokens
         ys = torch.full((1, 1), tgt_vocab.sos_idx, dtype=torch.long, device=device)
-        
+
         was_training = self.training
         self.eval()
-        
+
         with torch.no_grad():
             memory = self.encode(src_tensor, src_mask)
             for _ in range(max_len - 1):
@@ -494,9 +523,9 @@ class Transformer(nn.Module):
                 ys = torch.cat([ys, next_token], dim=1)
                 if next_token.item() == tgt_vocab.eos_idx:
                     break
-                    
+
         self.train(was_training)
-        
+
         # Detokenize target tokens
         tgt_indices = ys.squeeze(0).tolist()
         pred_tokens = []
@@ -505,5 +534,5 @@ class Transformer(nn.Module):
                 break
             if idx not in {tgt_vocab.sos_idx, tgt_vocab.pad_idx}:
                 pred_tokens.append(tgt_vocab.lookup_token(idx))
-                
+
         return " ".join(pred_tokens)
