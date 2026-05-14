@@ -338,10 +338,12 @@ class Transformer(nn.Module):
     Full Encoder-Decoder Transformer for sequence-to-sequence tasks.
     """
 
+    _cached_dataset = None
+
     def __init__(
         self,
-        src_vocab_size: int = 10,
-        tgt_vocab_size: int = 10,
+        src_vocab_size: int = None,
+        tgt_vocab_size: int = None,
         d_model: int = 512,
         N: int = 6,
         num_heads: int = 8,
@@ -351,6 +353,26 @@ class Transformer(nn.Module):
         use_scale: bool = True,
     ) -> None:
         super().__init__()
+        
+        # Autograder compatibility: if not provided, try to load from checkpoint
+        if src_vocab_size is None or tgt_vocab_size is None:
+            import os
+            if os.path.exists("checkpoint.pt"):
+                checkpoint = torch.load("checkpoint.pt", map_location="cpu", weights_only=False)
+                config = checkpoint.get("model_config", {})
+                src_vocab_size = config.get("src_vocab_size", 10)
+                tgt_vocab_size = config.get("tgt_vocab_size", 10)
+                d_model = config.get("d_model", d_model)
+                N = config.get("N", N)
+                num_heads = config.get("num_heads", num_heads)
+                d_ff = config.get("d_ff", d_ff)
+                dropout = config.get("dropout", dropout)
+                pos_encoding_type = config.get("pos_encoding_type", pos_encoding_type)
+                use_scale = config.get("use_scale", use_scale)
+            else:
+                src_vocab_size = 10
+                tgt_vocab_size = 10
+
         self.src_vocab_size = src_vocab_size
         self.tgt_vocab_size = tgt_vocab_size
         self.d_model = d_model
@@ -423,3 +445,60 @@ class Transformer(nn.Module):
     ) -> torch.Tensor:
         memory = self.encode(src, src_mask)
         return self.decode(memory, src_mask, tgt, tgt_mask)
+
+    def infer(self, src_text: str, max_len: int = 100) -> str:
+        """
+        Greedy decoding inference for the autograder.
+        """
+        device = next(self.parameters()).device
+        
+        # Load vocabularies lazily to save time during multiple inferences
+        if Transformer._cached_dataset is None:
+            import sys
+            import os
+            # Ensure we can import from the current directory
+            sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+            from dataset import Multi30kDataset
+            Transformer._cached_dataset = Multi30kDataset(split="test", min_freq=2, max_length=100)
+            
+        dataset = Transformer._cached_dataset
+        src_vocab = dataset.src_vocab
+        tgt_vocab = dataset.tgt_vocab
+        src_tokenizer = dataset.src_tokenizer
+        
+        # Tokenize source text
+        tokens = src_tokenizer(src_text)
+        src_ids = [src_vocab.sos_idx] + src_vocab.lookup_indices(tokens) + [src_vocab.eos_idx]
+        src_tensor = torch.tensor(src_ids, dtype=torch.long).unsqueeze(0).to(device)
+        
+        # Create masks
+        src_mask = make_src_mask(src_tensor, pad_idx=src_vocab.pad_idx)
+        
+        # Generate target tokens
+        ys = torch.full((1, 1), tgt_vocab.sos_idx, dtype=torch.long, device=device)
+        
+        was_training = self.training
+        self.eval()
+        
+        with torch.no_grad():
+            memory = self.encode(src_tensor, src_mask)
+            for _ in range(max_len - 1):
+                tgt_mask = make_tgt_mask(ys, pad_idx=tgt_vocab.pad_idx)
+                logits = self.decode(memory, src_mask, ys, tgt_mask)
+                next_token = logits[:, -1].argmax(dim=-1, keepdim=True)
+                ys = torch.cat([ys, next_token], dim=1)
+                if next_token.item() == tgt_vocab.eos_idx:
+                    break
+                    
+        self.train(was_training)
+        
+        # Detokenize target tokens
+        tgt_indices = ys.squeeze(0).tolist()
+        pred_tokens = []
+        for idx in tgt_indices:
+            if idx == tgt_vocab.eos_idx:
+                break
+            if idx not in {tgt_vocab.sos_idx, tgt_vocab.pad_idx}:
+                pred_tokens.append(tgt_vocab.lookup_token(idx))
+                
+        return " ".join(pred_tokens)
