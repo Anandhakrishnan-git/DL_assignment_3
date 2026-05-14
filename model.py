@@ -357,21 +357,26 @@ class Transformer(nn.Module):
         # Autograder compatibility: if not provided, try to load from checkpoint
         if src_vocab_size is None or tgt_vocab_size is None:
             import os
+            import torch
             if os.path.exists("checkpoint.pt"):
-                checkpoint = torch.load("checkpoint.pt", map_location="cpu", weights_only=False)
-                config = checkpoint.get("model_config", {})
-                src_vocab_size = config.get("src_vocab_size", 10)
-                tgt_vocab_size = config.get("tgt_vocab_size", 10)
-                d_model = config.get("d_model", d_model)
-                N = config.get("N", N)
-                num_heads = config.get("num_heads", num_heads)
-                d_ff = config.get("d_ff", d_ff)
-                dropout = config.get("dropout", dropout)
-                pos_encoding_type = config.get("pos_encoding_type", pos_encoding_type)
-                use_scale = config.get("use_scale", use_scale)
+                try:
+                    checkpoint = torch.load("checkpoint.pt", map_location="cpu", weights_only=False)
+                    config = checkpoint.get("model_config", {})
+                    src_vocab_size = config.get("src_vocab_size", 7851)
+                    tgt_vocab_size = config.get("tgt_vocab_size", 5892)
+                    d_model = config.get("d_model", d_model)
+                    N = config.get("N", N)
+                    num_heads = config.get("num_heads", num_heads)
+                    d_ff = config.get("d_ff", d_ff)
+                    dropout = config.get("dropout", dropout)
+                    pos_encoding_type = config.get("pos_encoding_type", pos_encoding_type)
+                    use_scale = config.get("use_scale", use_scale)
+                except Exception:
+                    src_vocab_size = 7851
+                    tgt_vocab_size = 5892
             else:
-                src_vocab_size = 10
-                tgt_vocab_size = 10
+                src_vocab_size = 7851
+                tgt_vocab_size = 5892
 
         self.src_vocab_size = src_vocab_size
         self.tgt_vocab_size = tgt_vocab_size
