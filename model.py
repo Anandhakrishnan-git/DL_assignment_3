@@ -47,11 +47,12 @@ def _fallback_tokenize(text: str) -> list[str]:
 
 def _build_inference_assets():
     from fast_vocab import SRC_ITOS, SRC_STOI, TGT_ITOS, TGT_STOI
+    from dataset import _load_spacy_tokenizer
 
     return {
         "src_vocab": _InferenceVocab(SRC_ITOS, SRC_STOI),
         "tgt_vocab": _InferenceVocab(TGT_ITOS, TGT_STOI),
-        "src_tokenizer": _fallback_tokenize,
+        "src_tokenizer": _load_spacy_tokenizer("de"),
     }
 
 
@@ -518,7 +519,16 @@ class Transformer(nn.Module):
             memory = self.encode(src_tensor, src_mask)
             for _ in range(max_len - 1):
                 tgt_mask = make_tgt_mask(ys, pad_idx=tgt_vocab.pad_idx)
-                logits = self.decode(memory, src_mask, ys, tgt_mask)
+                
+                # Optimized decoding: avoid computing generator for all tokens
+                tgt_embeddings = self.tgt_embedding(ys) * self.embedding_scale
+                tgt_embeddings = self.positional_encoding(tgt_embeddings)
+                decoder_output = self.decoder(tgt_embeddings, memory, src_mask, tgt_mask)
+                
+                # Apply generator ONLY to the last token to save computation
+                last_token_output = decoder_output[:, -1:, :]
+                logits = self.generator(last_token_output)
+                
                 next_token = logits[:, -1].argmax(dim=-1, keepdim=True)
                 ys = torch.cat([ys, next_token], dim=1)
                 if next_token.item() == tgt_vocab.eos_idx:
