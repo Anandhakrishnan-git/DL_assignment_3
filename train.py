@@ -1,12 +1,25 @@
 """
-train.py - Training Pipeline, Inference & Evaluation
+train.py — Training Pipeline, Inference & Evaluation
 DA6401 Assignment 3: "Attention Is All You Need"
+
+AUTOGRADER CONTRACT (DO NOT MODIFY SIGNATURES):
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  greedy_decode(model, src, src_mask, max_len, start_symbol)         │
+  │      → torch.Tensor  shape [1, out_len]  (token indices)            │
+  │                                                                     │
+  │  evaluate_bleu(model, test_dataloader, tgt_vocab, device)           │
+  │      → float  (corpus-level BLEU score, 0–100)                      │
+  │                                                                     │
+  │  save_checkpoint(model, optimizer, scheduler, epoch, path) → None   │
+  │  load_checkpoint(path, model, optimizer, scheduler)        → int    │
+  └─────────────────────────────────────────────────────────────────────┘
 """
 
 import math
 import os
 from collections import Counter
 from contextlib import nullcontext
+from math import ceil
 from typing import Optional
 
 import torch
@@ -16,17 +29,40 @@ from tqdm import tqdm
 import argparse
 import matplotlib.pyplot as plt
 
-try:
-    import wandb
-except ImportError:
-    wandb = None
-
 from model import Transformer, make_src_mask, make_tgt_mask
 
+wandb = None
+
+
+def _ensure_wandb():
+    global wandb
+    if wandb is not None:
+        return wandb
+
+    try:
+        import wandb as wandb_module
+    except ImportError:
+        return None
+
+    wandb = wandb_module
+    return wandb
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  LABEL SMOOTHING LOSS  
+# ══════════════════════════════════════════════════════════════════════
 
 class LabelSmoothingLoss(nn.Module):
     """
-    Label smoothing as in "Attention Is All You Need".
+    Label smoothing as in "Attention Is All You Need"
+
+    Smoothed target distribution:
+        y_smooth = (1 - eps) * one_hot(y) + eps / (vocab_size - 1)
+
+    Args:
+        vocab_size (int)  : Number of output classes.
+        pad_idx    (int)  : Index of <pad> token — receives 0 probability.
+        smoothing  (float): Smoothing factor ε (default 0.1).
     """
 
     def __init__(self, vocab_size: int, pad_idx: int, smoothing: float = 0.1) -> None:
@@ -73,6 +109,10 @@ class LabelSmoothingLoss(nn.Module):
         return loss.mean() * 0.0
 
 
+# ══════════════════════════════════════════════════════════════════════
+#   TRAINING LOOP  
+# ══════════════════════════════════════════════════════════════════════
+
 def run_epoch(
     data_iter,
     model: Transformer,
@@ -82,9 +122,31 @@ def run_epoch(
     epoch_num: int = 0,
     is_train: bool = True,
     device: str = "cpu",
-) -> float:
+    wandb_module=None,
+    global_step_start: int = 0,
+    grad_log_steps: int = 0,
+) -> tuple:
     """
     Run one epoch of training or evaluation.
+
+    Args:
+        data_iter  : DataLoader yielding (src, tgt) batches of token indices.
+        model      : Transformer instance.
+        loss_fn    : LabelSmoothingLoss (or any nn.Module loss).
+        optimizer  : Optimizer (None during eval).
+        scheduler  : NoamScheduler instance (None during eval).
+        epoch_num  : Current epoch index (for logging).
+        is_train   : If True, perform backward pass and scheduler step.
+        device     : 'cpu' or 'cuda'.
+        wandb_module : Optional W&B module for step-level logging.
+        global_step_start : Number of optimizer updates completed before this epoch.
+        grad_log_steps : Log gradient norms for the first N optimizer updates.
+
+    Returns:
+        avg_loss : Average loss over the epoch (float).
+        avg_confidence : Average softmax prob of correct token (float).
+        avg_accuracy : Token accuracy over non-pad targets (float).
+        global_step : Updated optimizer step count after the epoch (int).
     """
     if is_train and optimizer is None:
         raise ValueError("An optimizer is required when is_train=True.")
@@ -92,11 +154,17 @@ def run_epoch(
     pad_idx = getattr(loss_fn, "pad_idx", 1)
     model.train(is_train)
 
-    total_loss = 0.0
+    total_loss   = 0.0
     total_tokens = 0
+    total_confidence = 0.0
+    total_correct = 0
+    global_step = global_step_start
+
+    # Collect step-level gradient norms in memory — no network calls during training
+    grad_log_buffer = []
 
     grad_context = nullcontext() if is_train else torch.no_grad()
-    
+
     pbar = tqdm(data_iter, desc=f"Epoch {epoch_num} [{'Train' if is_train else 'Val'}]", unit="batch")
     for src, tgt in pbar:
         src = src.to(device)
@@ -119,29 +187,48 @@ def run_epoch(
 
         if is_train:
             loss.backward()
-            
-            # Task 2.2: Log gradient norms
-            if scheduler is not None and hasattr(scheduler, "d_model") and wandb is not None and wandb.run is not None:
+
+            next_step = global_step + 1
+            if next_step <= grad_log_steps:
                 q_grad = model.encoder.layers[0].self_attn.W_q.weight.grad
                 k_grad = model.encoder.layers[0].self_attn.W_k.weight.grad
                 if q_grad is not None and k_grad is not None:
-                    wandb.log({
+                    grad_log_buffer.append({
+                        "train_step": next_step,
                         "grad_norm_Wq": q_grad.norm().item(),
                         "grad_norm_Wk": k_grad.norm().item(),
-                    }, commit=False)
-            
+                    })
+
             optimizer.step()
             if scheduler is not None:
                 scheduler.step()
+            global_step = next_step
 
         non_pad_tokens = int(decoder_target.ne(pad_idx).sum().item())
         total_loss += loss.item() * max(non_pad_tokens, 1)
         total_tokens += max(non_pad_tokens, 1)
-        
+
+        with torch.no_grad():
+            probs = torch.softmax(logits.reshape(-1, logits.size(-1)).detach(), dim=-1)
+            flat_target = decoder_target.reshape(-1)
+            mask = flat_target.ne(pad_idx)
+            correct_probs = probs[torch.arange(probs.size(0), device=probs.device), flat_target]
+            total_confidence += correct_probs[mask].sum().item()
+            predictions = probs.argmax(dim=-1)
+            total_correct += predictions[mask].eq(flat_target[mask]).sum().item()
+
         pbar.set_postfix(loss=loss.item())
 
-    return total_loss / max(total_tokens, 1)
+    avg_loss       = total_loss / max(total_tokens, 1)
+    avg_confidence = total_confidence / max(total_tokens, 1)
+    avg_accuracy   = total_correct / max(total_tokens, 1)
 
+    return avg_loss, avg_confidence, avg_accuracy, global_step, grad_log_buffer
+
+
+# ══════════════════════════════════════════════════════════════════════
+#   GREEDY DECODING  
+# ══════════════════════════════════════════════════════════════════════
 
 def greedy_decode(
     model: Transformer,
@@ -154,6 +241,20 @@ def greedy_decode(
 ) -> torch.Tensor:
     """
     Generate a translation token-by-token using greedy decoding.
+
+    Args:
+        model        : Trained Transformer.
+        src          : Source token indices, shape [1, src_len].
+        src_mask     : shape [1, 1, 1, src_len].
+        max_len      : Maximum number of tokens to generate.
+        start_symbol : Vocabulary index of <sos>.
+        end_symbol   : Vocabulary index of <eos>.
+        device       : 'cpu' or 'cuda'.
+
+    Returns:
+        ys : Generated token indices, shape [1, out_len].
+             Includes start_symbol; stops at (and includes) end_symbol
+             or when max_len is reached.
     """
     was_training = model.training
     model.eval()
@@ -267,6 +368,10 @@ def _corpus_bleu(
     return 100.0 * bleu
 
 
+# ══════════════════════════════════════════════════════════════════════
+#   BLEU EVALUATION  
+# ══════════════════════════════════════════════════════════════════════
+
 def evaluate_bleu(
     model: Transformer,
     test_dataloader: DataLoader,
@@ -276,6 +381,19 @@ def evaluate_bleu(
 ) -> float:
     """
     Evaluate translation quality with corpus-level BLEU score.
+
+    Args:
+        model           : Trained Transformer (in eval mode).
+        test_dataloader : DataLoader over the test split.
+                          Each batch yields (src, tgt) token-index tensors.
+        tgt_vocab       : Vocabulary object with idx_to_token mapping.
+                          Must support  tgt_vocab.itos[idx]  or
+                          tgt_vocab.lookup_token(idx).
+        device          : 'cpu' or 'cuda'.
+        max_len         : Max decode length per sentence.
+
+    Returns:
+        bleu_score : Corpus-level BLEU (float, range 0–100).
     """
     start_symbol = _lookup_vocab_index(tgt_vocab, "<sos>")
     end_symbol = _lookup_vocab_index(tgt_vocab, "<eos>")
@@ -313,6 +431,10 @@ def evaluate_bleu(
     return _corpus_bleu(references, hypotheses)
 
 
+# ══════════════════════════════════════════════════════════════════════
+# ➅  CHECKPOINT UTILITIES  (autograder loads your model from disk)
+# ══════════════════════════════════════════════════════════════════════
+
 def save_checkpoint(
     model: Transformer,
     optimizer: torch.optim.Optimizer,
@@ -322,6 +444,26 @@ def save_checkpoint(
 ) -> None:
     """
     Save model + optimiser + scheduler state to disk.
+
+    The autograder will call load_checkpoint to restore your model.
+    Do NOT change the keys in the saved dict.
+
+    Args:
+        model     : Transformer instance.
+        optimizer : Optimizer instance.
+        scheduler : NoamScheduler instance.
+        epoch     : Current epoch number.
+        path      : File path to save to (default 'checkpoint.pt').
+
+    Saves a dict with keys:
+        'epoch', 'model_state_dict', 'optimizer_state_dict',
+        'scheduler_state_dict', 'model_config'
+
+    model_config must contain all kwargs needed to reconstruct
+    Transformer(**model_config), e.g.:
+        {'src_vocab_size': ..., 'tgt_vocab_size': ...,
+         'd_model': ..., 'N': ..., 'num_heads': ...,
+         'd_ff': ..., 'dropout': ...}
     """
     model_config = getattr(model, "model_config", None)
     if model_config is None:
@@ -347,6 +489,15 @@ def load_checkpoint(
 ) -> int:
     """
     Restore model (and optionally optimizer/scheduler) state from disk.
+
+    Args:
+        path      : Path to checkpoint file saved by save_checkpoint.
+        model     : Uninitialised Transformer with matching architecture.
+        optimizer : Optimizer to restore (pass None to skip).
+        scheduler : Scheduler to restore (pass None to skip).
+
+    Returns:
+        epoch : The epoch at which the checkpoint was saved (int).
     """
     try:
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
@@ -372,8 +523,9 @@ def visualize_attention(
     """
     Task 2.3: Visualize attention maps for the last encoder layer.
     """
+    was_training = model.training
     model.eval()
-    # Pick a sample sentence
+
     example = dataset[0]
     src, _ = example
     src = src.unsqueeze(0).to(device)
@@ -384,35 +536,69 @@ def visualize_attention(
     
     # Get the last encoder layer's self-attention weights
     last_layer = model.encoder.layers[-1]
-    attn_weights = last_layer.self_attn.attn_weights.squeeze(0) # [num_heads, src_len, src_len]
+    attn_weights = last_layer.self_attn.attn_weights.squeeze(0).detach().cpu()
     
     num_heads = attn_weights.size(0)
-    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+    num_cols = min(4, num_heads)
+    num_rows = ceil(num_heads / num_cols)
+    fig, axes = plt.subplots(num_rows, num_cols, figsize=(5 * num_cols, 4.5 * num_rows))
     axes = axes.flatten()
     
     src_tokens = [dataset.src_vocab.lookup_token(idx.item()) for idx in src[0]]
     
     for i in range(num_heads):
         ax = axes[i]
-        im = ax.imshow(attn_weights[i].cpu().numpy(), cmap="viridis")
+        im = ax.imshow(attn_weights[i].numpy(), cmap="viridis", vmin=0.0, vmax=1.0)
         ax.set_title(f"Head {i+1}")
         ax.set_xticks(range(len(src_tokens)))
         ax.set_xticklabels(src_tokens, rotation=90)
         ax.set_yticks(range(len(src_tokens)))
         ax.set_yticklabels(src_tokens)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    for ax in axes[num_heads:]:
+        ax.axis("off")
     
     plt.tight_layout()
     plt.savefig(save_path)
+    plt.close(fig)
     print(f"Attention maps saved to {save_path}")
+    model.train(was_training)
     
-    import wandb
-    if wandb is not None and wandb.run is not None:
-        wandb.log({"attention_maps": wandb.Image(save_path)})
+    wandb_module = _ensure_wandb()
+    if wandb_module is not None and wandb_module.run is not None:
+        try:
+            wandb_module.log({"attention_maps": wandb_module.Image(save_path)})
+        except Exception as e:
+            print(f"Warning: W&B attention maps log failed: {e}")
 
+
+# ══════════════════════════════════════════════════════════════════════
+#   EXPERIMENT ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════
 
 def run_training_experiment() -> None:
     """
     Set up and run the full training experiment.
+
+    Steps:
+        1. Init W&B:   wandb.init(project="da6401-a3", config={...})
+        2. Build dataset / vocabs from dataset.py
+        3. Create DataLoaders for train / val splits
+        4. Instantiate Transformer with hyperparameters from config
+        5. Instantiate Adam optimizer (β1=0.9, β2=0.98, ε=1e-9)
+        6. Instantiate NoamScheduler(optimizer, d_model, warmup_steps=4000)
+        7. Instantiate LabelSmoothingLoss(vocab_size, pad_idx, smoothing=0.1)
+        8. Training loop:
+               for epoch in range(num_epochs):
+                   run_epoch(train_loader, model, loss_fn,
+                             optimizer, scheduler, epoch, is_train=True)
+                   run_epoch(val_loader, model, loss_fn,
+                             None, None, epoch, is_train=False)
+                   save_checkpoint(model, optimizer, scheduler, epoch)
+        9. Final BLEU on test set:
+               bleu = evaluate_bleu(model, test_loader, tgt_vocab)
+               wandb.log({'test_bleu': bleu})
     """
     from dataset import Multi30kDataset, collate_batch
     from lr_scheduler import NoamScheduler
@@ -436,21 +622,39 @@ def run_training_experiment() -> None:
     parser.add_argument("--pos_encoding", type=str, default="sinusoidal", choices=["sinusoidal", "learned"])
     parser.add_argument("--visualize", action="store_true")
     parser.add_argument("--project", type=str, default="da6401-a3")
+    parser.add_argument("--grad_log_steps", type=int, default=1000)
+    parser.add_argument("--val_bleu_every", type=int, default=1)
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     config = vars(args)
     config["device"] = device
-    config["checkpoint_path"] = f"checkpoint_{args.scheduler}_{args.pos_encoding}_{'scale' if args.use_scale else 'no_scale'}.pt"
+    ls_suffix = "" if args.label_smoothing == 0.1 else f"_ls{args.label_smoothing}"
+    experiment_name = f"{args.scheduler}_{args.pos_encoding}_{'scale' if args.use_scale else 'no_scale'}{ls_suffix}"
+    config["checkpoint_path"] = f"checkpoint_{experiment_name}.pt"
+
+    # Only log step-level gradients for the scaling ablation (Exp 2: baseline and unscaled)
+    # Disable for other experiments to avoid network socket overhead
+    is_scaling_ablation = (
+        args.scheduler == "noam"
+        and args.pos_encoding == "sinusoidal"
+        and args.label_smoothing == 0.1
+    )
+    if not is_scaling_ablation and args.grad_log_steps == 1000:
+        config["grad_log_steps"] = 0
+    
+    # Store metrics locally to prevent W&B socket crashes
+    local_metrics = []
 
     wandb_run = None
-    if wandb is not None:
+    wandb_module = _ensure_wandb()
+    if wandb_module is not None:
         init_kwargs = {"project": args.project, "config": config}
         if "WANDB_MODE" in os.environ:
             init_kwargs["mode"] = os.environ["WANDB_MODE"]
-        wandb_run = wandb.init(**init_kwargs)
-        config = dict(wandb.config)
+        wandb_run = wandb_module.init(**init_kwargs)
+        config = dict(wandb_module.config)
 
     print("Initializing datasets and vocabulary...")
     train_dataset = Multi30kDataset(
@@ -533,8 +737,9 @@ def run_training_experiment() -> None:
 
     print(f"Starting training for {config['num_epochs']} epochs...")
     best_val_loss = float("inf")
+    global_step = 0
     for epoch in range(config["num_epochs"]):
-        train_loss = run_epoch(
+        train_loss, train_conf, train_acc, global_step, grad_buffer = run_epoch(
             train_loader,
             model,
             loss_fn,
@@ -543,8 +748,11 @@ def run_training_experiment() -> None:
             epoch_num=epoch,
             is_train=True,
             device=device,
+            wandb_module=wandb_module,
+            global_step_start=global_step,
+            grad_log_steps=config["grad_log_steps"],
         )
-        val_loss = run_epoch(
+        val_loss, val_conf, val_acc, _, _ = run_epoch(
             val_loader,
             model,
             loss_fn,
@@ -555,25 +763,72 @@ def run_training_experiment() -> None:
             device=device,
         )
 
+        val_bleu = None
+        if config["val_bleu_every"] > 0 and (epoch + 1) % config["val_bleu_every"] == 0:
+            val_bleu = evaluate_bleu(
+                model,
+                val_loader,
+                train_dataset.tgt_vocab,
+                device=device,
+                max_len=config["max_length"],
+            )
+
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             save_checkpoint(model, optimizer, scheduler, epoch, path=config["checkpoint_path"])
 
         log_payload = {
             "epoch": epoch + 1,
+            "train_step": global_step,
             "train_loss": train_loss,
             "val_loss": val_loss,
+            "train_accuracy": train_acc,
+            "val_accuracy": val_acc,
+            "train_prediction_confidence": train_conf,
+            "val_prediction_confidence": val_conf,
             "lr": optimizer.param_groups[0]["lr"],
         }
+        if val_bleu is not None:
+            log_payload["val_bleu"] = val_bleu
 
+        # Always print epoch summary to console
+        print(f"\n[Epoch {epoch + 1} Summary] "
+              f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+              f"Train Acc: {train_acc*100:.2f}% | Val Acc: {val_acc*100:.2f}%"
+              f"{f' | Val BLEU: {val_bleu:.2f}' if val_bleu is not None else ''}")
+
+        # Single epoch-level W&B log — no step-level calls
         if wandb_run is not None:
-            wandb.log(log_payload)
-        else:
-            print(log_payload)
-            
+            try:
+                wandb.log(log_payload)
+            except Exception as e:
+                print(f"Warning: W&B epoch log failed: {e}")
+
+        local_epoch_entry = {
+            "epoch": epoch + 1,
+            "train_step": global_step,
+            "train/loss": train_loss,
+            "val/loss": val_loss,
+            "train/accuracy": train_acc,
+            "val/accuracy": val_acc,
+            "train/prediction_confidence": train_conf,
+            "val/prediction_confidence": val_conf,
+            "lr": optimizer.param_groups[0]["lr"],
+        }
+        if val_bleu is not None:
+            local_epoch_entry["val/bleu"] = val_bleu
+        # Embed gradient norm buffer inline so everything is in one file
+        if grad_buffer:
+            local_epoch_entry["grad_norms"] = grad_buffer
+        local_metrics.append(local_epoch_entry)
+
+        import json
+        with open(f"metrics_{experiment_name}.json", "w") as f:
+            json.dump(local_metrics, f, indent=2)
+
         # Task 2.3: Visualization
         if args.visualize and (epoch == config["num_epochs"] - 1):
-            visualize_attention(model, train_dataset, device)
+            visualize_attention(model, train_dataset, device, save_path=f"attention_maps_{experiment_name}.png")
 
     if os.path.exists(config["checkpoint_path"]):
         load_checkpoint(config["checkpoint_path"], model, optimizer=None, scheduler=None)
@@ -586,11 +841,23 @@ def run_training_experiment() -> None:
         max_len=config["max_length"],
     )
 
+    # Save test BLEU locally so it is preserved
+    local_metrics.append({"test_bleu": bleu})
+    import json
+    with open(f"metrics_{experiment_name}.json", "w") as f:
+        json.dump(local_metrics, f)
+
+    print(f"\nFinal Test BLEU: {bleu:.2f}")
+
     if wandb_run is not None:
-        wandb.log({"test_bleu": bleu})
-        wandb_run.finish()
-    else:
-        print({"test_bleu": bleu})
+        try:
+            wandb.log({"test_bleu": bleu})
+        except Exception as e:
+            print(f"Warning: W&B final log failed: {e}")
+        try:
+            wandb_run.finish()
+        except Exception as e:
+            print(f"Warning: W&B finish failed: {e}")
 
 
 if __name__ == "__main__":
